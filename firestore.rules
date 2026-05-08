@@ -1,0 +1,93 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Default Deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- PHASE 3: Primitives ---
+    function isSignedIn() { return request.auth != null; }
+    function isEmailVerified() { return isSignedIn() && request.auth.token.email_verified == true; }
+    function isValidId(id) { return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function isOwner(userId) { return isSignedIn() && request.auth.uid == userId; }
+    function isAdmin() { 
+      return isSignedIn() && (
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
+        request.auth.token.email == 'marko13366@gmail.com'
+      );
+    }
+
+    // --- PHASE 2: Validation Blueprints ---
+
+    function isValidUser(data) {
+      return data.keys().hasAll(['uid', 'email']) &&
+             data.uid is string && data.uid.size() <= 128 &&
+             data.email is string && data.email.size() <= 255 &&
+             (data.get('displayName', '') is string && data.get('displayName', '').size() <= 100) &&
+             (data.get('photoURL', '') is string && data.get('photoURL', '').size() <= 1000) &&
+             (data.get('role', 'user') in ['user', 'admin']);
+    }
+
+    function isValidAttendance(data) {
+      return data.keys().hasAll(['userId', 'type', 'timestamp', 'location']) &&
+             data.userId is string && data.userId.size() <= 128 &&
+             data.type in ['check-in', 'check-out'] &&
+             data.timestamp == request.time &&
+             data.location is map &&
+             data.location.lat is number &&
+             data.location.lng is number &&
+             (data.get('photoUrl', '') is string && data.get('photoUrl', '').size() <= 500000) && // Allow larger base64 for photo
+             (data.get('status', 'pending') in ['pending', 'approved', 'rejected']);
+    }
+
+    // --- PHASE 4: Match Blocks ---
+
+    // Users Collection
+    match /users/{userId} {
+      allow get: if isSignedIn() && (isOwner(userId) || isAdmin());
+      allow list: if isAdmin();
+      
+      allow create: if isOwner(userId) && isEmailVerified() && isValidUser(incoming()) && 
+                       incoming().uid == userId && 
+                       incoming().role == 'user';
+      
+      allow update: if (
+        (isOwner(userId) && isEmailVerified() && isValidUser(incoming()) &&
+         incoming().uid == userId &&
+         incoming().role == existing().role && 
+         incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL'])) ||
+        (isAdmin() && isValidUser(incoming()) &&
+         incoming().diff(existing()).affectedKeys().hasOnly(['role']))
+      );
+    }
+
+    // Attendance Collection
+    match /attendance/{recordId} {
+      allow get: if isSignedIn() && (isOwner(existing().userId) || isAdmin());
+      
+      allow list: if isSignedIn() && (
+        (resource.data.userId == request.auth.uid) || isAdmin()
+      );
+
+      allow create: if isEmailVerified() && isValidId(recordId) && isValidAttendance(incoming()) &&
+                       incoming().userId == request.auth.uid &&
+                       incoming().status == 'pending' &&
+                       exists(/databases/$(database)/documents/users/$(request.auth.uid));
+
+      allow update: if isAdmin() && isValidAttendance(incoming()) &&
+                       incoming().diff(existing()).affectedKeys().hasOnly(['status']);
+      
+      allow delete: if isAdmin();
+    }
+
+    // Admins Collection
+    match /admins/{userId} {
+      allow read: if isSignedIn();
+      allow write: if false;
+    }
+  }
+}

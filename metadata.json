@@ -1,0 +1,6 @@
+{
+  "name": "Absen Pintar",
+  "description": "Aplikasi absensi modern dengan verifikasi lokasi dan foto.",
+  "requestFramePermissions": ["camera", "geolocation"],
+  "majorCapabilities": ["auth", "location"]
+}
