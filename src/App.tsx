@@ -322,7 +322,7 @@ export default function App() {
   const [allRecords, setAllRecords] = useState<AttendanceRecord[]>([]);
   const [allUsers, setAllUsers] = useState<UserProfile[]>([]);
 
-  // UI State
+  const [currentAttendanceType, setCurrentAttendanceType] = useState<AttendanceType | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [showCamera, setShowCamera] = useState(false);
   const [capturedImage, setCapturedImage] = useState<string | null>(null);
@@ -331,6 +331,25 @@ export default function App() {
   
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  // Passive Location Fetching
+  useEffect(() => {
+    if (user && !isAdminMode) {
+      const getPos = () => {
+        navigator.geolocation.getCurrentPosition(
+          (pos) => setLocation({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
+          (err) => {
+            console.warn("Initial location error", err);
+            // Don't show critical error on dashboard yet to keep it clean
+          },
+          { enableHighAccuracy: true, timeout: 10000 }
+        );
+      };
+      getPos();
+      const id = setInterval(getPos, 30000); // Update every 30s
+      return () => clearInterval(id);
+    }
+  }, [user, isAdminMode]);
 
   // 1. Auth Listener
   useEffect(() => {
@@ -347,14 +366,21 @@ export default function App() {
         try {
           const userDoc = await getDoc(userDocRef);
           if (userDoc.exists()) {
-            setProfile(userDoc.data() as UserProfile);
+            const data = userDoc.data() as UserProfile;
+            if (currentUser.email === 'marko13366@gmail.com' && data.role !== 'admin') {
+              await updateDoc(userDocRef, { role: 'admin' });
+              setProfile({ ...data, role: 'admin' });
+            } else {
+              setProfile(data);
+            }
           } else {
+            const isAdminEmail = currentUser.email === 'marko13366@gmail.com';
             const newProfile: UserProfile = {
               uid: currentUser.uid,
               displayName: currentUser.displayName || 'User',
               email: currentUser.email || '',
               photoURL: currentUser.photoURL || '',
-              role: 'user',
+              role: isAdminEmail ? 'admin' : 'user',
               createdAt: serverTimestamp()
             };
             await setDoc(userDocRef, newProfile);
@@ -436,6 +462,8 @@ export default function App() {
     setError(null);
     try {
       await signInWithPopup(auth, googleProvider, browserPopupRedirectResolver);
+      // Passive trigger for permissions
+      navigator.geolocation.getCurrentPosition(() => {}, () => {}, { timeout: 1000 });
     } catch (err: any) {
       console.error(err);
       if (err.code !== 'auth/cancelled-popup-request' && err.code !== 'auth/popup-closed-by-user') {
@@ -448,15 +476,19 @@ export default function App() {
 
   const handleSignOut = () => signOut(auth);
 
-  const startCamera = async () => {
+  const startCamera = async (type: AttendanceType) => {
     setError(null);
     setShowCamera(true);
+    setCurrentAttendanceType(type);
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } } 
+      });
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
       }
       
+      // Refresh location while opening camera
       navigator.geolocation.getCurrentPosition(
         (pos) => setLocation({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
         () => setError("Gagal mendapatkan lokasi. Izinkan akses lokasi."),
@@ -465,12 +497,21 @@ export default function App() {
     } catch (err) {
       console.error(err);
       setError("Gagal mengakses kamera. Izinkan akses kamera.");
-      setShowCamera(false);
     }
   };
 
-  const capturePhoto = () => {
-    if (videoRef.current && canvasRef.current) {
+  const captureAndSubmit = async () => {
+    if (!videoRef.current || !canvasRef.current || !currentAttendanceType) return;
+    if (!location) {
+      setError("Menunggu lokasi GPS... Pastikan GPS aktif.");
+      return;
+    }
+
+    setIsSubmitting(true);
+    setError(null);
+
+    try {
+      // 1. Capture
       const video = videoRef.current;
       const canvas = canvasRef.current;
       canvas.width = video.videoWidth;
@@ -478,45 +519,31 @@ export default function App() {
       const ctx = canvas.getContext('2d');
       ctx?.drawImage(video, 0, 0);
       const dataUrl = canvas.toDataURL('image/jpeg', 0.82);
-      setCapturedImage(dataUrl);
       
-      const stream = video.srcObject as MediaStream;
-      stream.getTracks().forEach(track => track.stop());
-    }
-  };
-
-  const submitAttendance = async (type: AttendanceType) => {
-    if (!user || !location || !capturedImage) {
-      setError("Data tidak lengkap (Lokasi atau Foto hilang).");
-      return;
-    }
-
-    setIsSubmitting(true);
-    setError(null);
-
-    const attendancePath = 'attendance';
-    try {
+      // 2. Submit
       const newRecord: Omit<AttendanceRecord, 'id'> = {
-        userId: user.uid,
-        userName: profile?.displayName || user.displayName || 'Unknown',
-        type,
+        userId: user!.uid,
+        userName: profile?.displayName || user!.displayName || 'Unknown',
+        type: currentAttendanceType,
         timestamp: serverTimestamp(),
         location: {
           lat: location.lat,
           lng: location.lng,
           address: "Lokasi saat ini" 
         },
-        photoUrl: capturedImage,
+        photoUrl: dataUrl,
         status: AttendanceStatus.PENDING
       };
 
-      await addDoc(collection(db, attendancePath), newRecord);
+      await addDoc(collection(db, 'attendance'), newRecord);
       
+      // 3. Cleanup
+      const stream = video.srcObject as MediaStream;
+      stream.getTracks().forEach(track => track.stop());
       setShowCamera(false);
-      setCapturedImage(null);
-      setLocation(null);
+      setCurrentAttendanceType(null);
     } catch (err) {
-      handleFirestoreError(err, OperationType.CREATE, attendancePath);
+      handleFirestoreError(err, OperationType.CREATE, 'attendance');
     } finally {
       setIsSubmitting(false);
     }
@@ -684,7 +711,7 @@ export default function App() {
                 <div className="grid grid-cols-2 gap-4">
                   <button 
                     disabled={hasCheckedIn || isSubmitting}
-                    onClick={startCamera}
+                    onClick={() => startCamera(AttendanceType.CHECK_IN)}
                     className={cn(
                       "group relative flex flex-col items-center justify-center gap-3 p-6 rounded-3xl border-2 transition-all active:scale-95",
                       hasCheckedIn 
@@ -704,7 +731,7 @@ export default function App() {
 
                   <button 
                     disabled={!hasCheckedIn || hasCheckedOut || isSubmitting}
-                    onClick={startCamera}
+                    onClick={() => startCamera(AttendanceType.CHECK_OUT)}
                     className={cn(
                       "group relative flex flex-col items-center justify-center gap-3 p-6 rounded-3xl border-2 transition-all active:scale-95",
                       !hasCheckedIn || hasCheckedOut
@@ -799,87 +826,77 @@ export default function App() {
             className="fixed inset-0 z-50 bg-black flex flex-col"
           >
             <div className="p-4 flex items-center justify-between text-white">
-              <button onClick={() => {
-                 if (videoRef.current?.srcObject) {
+              <button 
+                onClick={() => {
+                  if (videoRef.current?.srcObject) {
                     (videoRef.current.srcObject as MediaStream).getTracks().forEach(track => track.stop());
-                 }
-                 setShowCamera(false);
-                 setCapturedImage(null);
-              }} className="p-2 bg-white/10 rounded-full">
+                  }
+                  setShowCamera(false);
+                  setCurrentAttendanceType(null);
+                }} 
+                className="p-2 bg-white/10 rounded-full"
+              >
                 <XCircle className="w-6 h-6" />
               </button>
-              <h3 className="font-bold">Verifikasi Identitas</h3>
+              <h3 className="font-bold flex items-center gap-2">
+                <ShieldCheck className="w-4 h-4 text-blue-400" />
+                Verifikasi {currentAttendanceType?.replace('-', ' ')}
+              </h3>
               <div className="w-10" />
             </div>
 
-            <div className="flex-1 relative flex items-center justify-center">
-              {!capturedImage ? (
-                <video 
-                  ref={videoRef} 
-                  autoPlay 
-                  playsInline 
-                  className="w-full h-full object-cover"
-                />
-              ) : (
-                <img 
-                  src={capturedImage} 
-                  className="w-full h-full object-cover"
-                  alt="Captured" 
-                />
-              )}
+            <div className="flex-1 relative flex items-center justify-center overflow-hidden">
+              <video 
+                ref={videoRef} 
+                autoPlay 
+                playsInline 
+                className="w-full h-full object-cover mirror"
+              />
+              <canvas ref={canvasRef} className="hidden" />
               
               {/* Guides */}
               <div className="absolute inset-0 pointer-events-none flex items-center justify-center">
-                <div className="w-64 h-80 border-2 border-white/30 border-dashed rounded-[40px] relative">
-                  <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-4 h-4 bg-white/20 rounded-full" />
+                <div className="w-72 h-96 border-4 border-white/20 border-dashed rounded-[60px] relative">
+                  <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-8 h-8 bg-white/10 rounded-full blur-xl" />
                 </div>
               </div>
             </div>
 
-            <div className="p-8 bg-zinc-900 flex flex-col items-center gap-6">
+            <div className="p-8 bg-zinc-950 flex flex-col items-center gap-6">
               {error && (
-                <div className="flex items-center gap-2 text-red-400 text-sm bg-red-400/10 px-4 py-2 rounded-xl">
+                <div className="flex items-center gap-2 text-red-400 text-sm bg-red-400/10 px-4 py-2 rounded-xl border border-red-500/20 animate-pulse">
                   <AlertCircle className="w-4 h-4" />
                   {error}
                 </div>
               )}
 
-              {capturedImage ? (
-                <div className="flex gap-4 w-full">
-                  <button 
-                    onClick={() => setCapturedImage(null)}
-                    className="flex-1 bg-white/10 text-white font-bold py-4 rounded-2xl hover:bg-white/20 transition-colors"
-                  >
-                    Foto Ulang
-                  </button>
-                  <button 
-                    disabled={isSubmitting}
-                    onClick={() => submitAttendance(hasCheckedIn ? AttendanceType.CHECK_OUT : AttendanceType.CHECK_IN)}
-                    className="flex-1 bg-blue-600 text-white font-bold py-4 rounded-2xl shadow-xl shadow-blue-500/20 active:scale-95 transition-all flex items-center justify-center gap-2"
-                  >
-                    {isSubmitting && <Loader2 className="w-5 h-5 animate-spin" />}
-                    Kirim Absen
-                  </button>
-                </div>
-              ) : (
-                <button 
-                  onClick={capturePhoto}
-                  className="w-20 h-20 bg-white rounded-full flex items-center justify-center p-1 border-4 border-white/30 active:scale-90 transition-transform"
-                >
-                  <div className="w-full h-full bg-white rounded-full flex items-center justify-center">
-                    <Camera className="w-8 h-8 text-black" />
-                  </div>
-                </button>
-              )}
+              <button 
+                onClick={captureAndSubmit}
+                disabled={isSubmitting}
+                className={cn(
+                  "group relative w-full max-w-xs flex items-center justify-center gap-3 bg-white text-zinc-900 py-5 rounded-[2rem] font-bold transition-all active:scale-95 shadow-2xl shadow-white/5",
+                  isSubmitting ? "opacity-50 cursor-not-allowed" : "hover:scale-[1.02]"
+                )}
+              >
+                {isSubmitting ? (
+                  <Loader2 className="w-6 h-6 animate-spin" />
+                ) : (
+                  <>
+                    <Camera className="w-6 h-6" />
+                    Ambil Foto & Kirim
+                  </>
+                )}
+              </button>
               
-              <div className="flex items-center gap-6 text-white/60 text-sm">
-                <div className="flex items-center gap-2">
-                  <MapPin className={cn("w-4 h-4", location ? "text-green-400" : "text-zinc-500")} />
-                  {location ? "Lokasi Siap" : "Mencari Lokasi..."}
+              <div className="flex items-center gap-6 text-zinc-500 text-xs font-bold uppercase tracking-widest">
+                <div className="flex items-center gap-1.5">
+                  <MapPin className={cn("w-4 h-4 transition-colors", location ? "text-blue-500" : "text-zinc-800")} />
+                  GPS {location ? "Aktif" : "Mencari..."}
                 </div>
+                <div className="w-1 h-1 bg-zinc-800 rounded-full" />
+                <div>Wajah Terdeteksi</div>
               </div>
             </div>
-            <canvas ref={canvasRef} className="hidden" />
           </motion.div>
         )}
       </AnimatePresence>
